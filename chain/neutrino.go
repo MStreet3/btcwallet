@@ -397,17 +397,9 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		}
 	}
 
-	inputsToWatch := make([]neutrino.InputWithScript, 0, len(outPoints))
-	for op, addr := range outPoints {
-		addrScript, err := txscript.PayToAddrScript(addr)
-		if err != nil {
-			return err
-		}
-
-		inputsToWatch = append(inputsToWatch, neutrino.InputWithScript{
-			OutPoint: op,
-			PkScript: addrScript,
-		})
+	inputsToWatch, err := toInputsToWatch(outPoints)
+	if err != nil {
+		return err
 	}
 
 	s.clientMtx.Lock()
@@ -752,4 +744,20 @@ out:
 	s.Stop()
 	close(s.dequeueNotification)
 	s.wg.Done()
+}
+
+func toInputsToWatch(ops map[wire.OutPoint]btcutil.Address) ([]neutrino.InputWithScript, error) {
+	inputsToWatch := make([]neutrino.InputWithScript, 0, len(ops))
+	for op, addr := range ops {
+		addrScript, err := txscript.PayToAddrScript(addr)
+		if err != nil {
+			return nil, err
+		}
+
+		inputsToWatch = append(inputsToWatch, neutrino.InputWithScript{
+			OutPoint: op,
+			PkScript: addrScript,
+		})
+	}
+	return inputsToWatch, nil
 }
