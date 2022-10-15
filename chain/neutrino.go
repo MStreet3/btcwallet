@@ -20,14 +20,33 @@ import (
 	"github.com/lightninglabs/neutrino/headerfs"
 )
 
+type ChainService interface {
+	Start() error
+	GetBlock(chainhash.Hash, ...neutrino.QueryOption) (*btcutil.Block, error)
+	GetBlockHeight(*chainhash.Hash) (int32, error)
+	BestBlock() (*headerfs.BlockStamp, error)
+	GetBlockHash(int64) (*chainhash.Hash, error)
+	GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, error)
+	IsCurrent() bool
+	SendTransaction(*wire.MsgTx) error
+	GetCFilter(chainhash.Hash, wire.FilterType, ...neutrino.QueryOption) (*gcs.Filter, error)
+}
+
+type Rescanner interface {
+	Start() <-chan error
+	WaitForShutdown()
+	Update(...neutrino.UpdateOption) error
+}
+
 // NeutrinoClient is an implementation of the btcwalet chain.Interface interface.
 type NeutrinoClient struct {
-	CS *neutrino.ChainService
+	CS ChainService
 
 	chainParams *chaincfg.Params
 
 	// We currently support one rescan/notifiction goroutine per client
-	rescan *neutrino.Rescan
+	rescan       Rescanner
+	newRescanner func(neutrino.ChainSource, ...neutrino.RescanOption) Rescanner
 
 	enqueueNotification     chan interface{}
 	dequeueNotification     chan interface{}
@@ -395,9 +414,11 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		return err
 	}
 
-	newRescan := neutrino.NewRescan(
+	newRescanner := s.getNewRescanner()
+
+	s.rescan = newRescanner(
 		&neutrino.RescanChainSource{
-			ChainService: s.CS,
+			ChainService: s.CS.(*neutrino.ChainService),
 		},
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
@@ -410,7 +431,6 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		neutrino.WatchAddrs(addrs...),
 		neutrino.WatchInputs(inputsToWatch...),
 	)
-	s.rescan = newRescan
 	s.rescanErr = s.rescan.Start()
 
 	return nil
@@ -450,9 +470,11 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	s.lastFilteredBlockHeader = nil
 
 	// Rescan with just the specified addresses.
-	newRescan := neutrino.NewRescan(
+	newRescanner := s.getNewRescanner()
+
+	s.rescan = newRescanner(
 		&neutrino.RescanChainSource{
-			ChainService: s.CS,
+			ChainService: s.CS.(*neutrino.ChainService),
 		},
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
@@ -463,7 +485,6 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		neutrino.QuitChan(s.rescanQuit),
 		neutrino.WatchAddrs(addrs...),
 	)
-	s.rescan = newRescan
 	s.rescanErr = s.rescan.Start()
 
 	return nil
@@ -735,6 +756,17 @@ out:
 	s.Stop()
 	close(s.dequeueNotification)
 	s.wg.Done()
+}
+
+// getNewRescanner injects the Rescanner constructor when called and defaults to using neutrino.NewRescan
+// when unspecified.
+func (s *NeutrinoClient) getNewRescanner() func(neutrino.ChainSource, ...neutrino.RescanOption) Rescanner {
+	if s.newRescanner == nil {
+		s.newRescanner = func(cs neutrino.ChainSource, ropts ...neutrino.RescanOption) Rescanner {
+			return neutrino.NewRescan(cs, ropts...)
+		}
+	}
+	return s.newRescanner
 }
 
 func toInputsToWatch(ops map[wire.OutPoint]btcutil.Address) ([]neutrino.InputWithScript, error) {
