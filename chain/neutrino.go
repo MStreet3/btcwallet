@@ -337,35 +337,34 @@ func (s *NeutrinoClient) pollCFilter(hash *chainhash.Hash) (*gcs.Filter, error) 
 // Rescan replicates the RPC client's Rescan command.
 func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Address,
 	outPoints map[wire.OutPoint]btcutil.Address) error {
-
 	s.clientMtx.Lock()
+	defer s.clientMtx.Unlock()
+
 	if !s.started {
-		s.clientMtx.Unlock()
 		return fmt.Errorf("can't do a rescan when the chain client " +
 			"is not started")
 	}
+
 	if s.scanning {
 		// Restart the rescan by killing the existing rescan.
 		close(s.rescanQuit)
-		rescan := s.rescan
-		s.clientMtx.Unlock()
-		rescan.WaitForShutdown()
-		s.clientMtx.Lock()
+		s.rescan.WaitForShutdown()
 		s.rescan = nil
 		s.rescanErr = nil
 	}
+
 	s.rescanQuit = make(chan struct{})
 	s.scanning = true
 	s.finished = false
 	s.lastProgressSent = false
 	s.lastFilteredBlockHeader = nil
 	s.isRescan = true
-	s.clientMtx.Unlock()
 
 	bestBlock, err := s.CS.BestBlock()
 	if err != nil {
 		return fmt.Errorf("can't get chain service's best block: %s", err)
 	}
+
 	header, err := s.CS.GetBlockHeader(&bestBlock.Hash)
 	if err != nil {
 		return fmt.Errorf("can't get block header for hash %v: %s",
@@ -376,14 +375,8 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 	// with state that indicates a "fresh" wallet, we'll send a
 	// notification indicating the rescan has "finished".
 	if header.BlockHash() == *startHash {
-		s.clientMtx.Lock()
 		s.finished = true
-		rescanQuit := s.rescanQuit
-		s.clientMtx.Unlock()
 
-		// Release the lock while dispatching the notification since
-		// it's possible for the notificationHandler to be waiting to
-		// acquire it before receiving the notification.
 		select {
 		case s.enqueueNotification <- &RescanFinished{
 			Hash:   startHash,
@@ -392,7 +385,7 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		}:
 		case <-s.quit:
 			return nil
-		case <-rescanQuit:
+		case <-s.rescanQuit:
 			return nil
 		}
 	}
@@ -402,7 +395,6 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		return err
 	}
 
-	s.clientMtx.Lock()
 	newRescan := neutrino.NewRescan(
 		&neutrino.RescanChainSource{
 			ChainService: s.CS,
@@ -420,7 +412,6 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 	)
 	s.rescan = newRescan
 	s.rescanErr = s.rescan.Start()
-	s.clientMtx.Unlock()
 
 	return nil
 }
