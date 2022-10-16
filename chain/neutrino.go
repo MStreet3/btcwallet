@@ -85,12 +85,13 @@ func (s *NeutrinoClient) BackEnd() string {
 
 // Start replicates the RPC client's Start method.
 func (s *NeutrinoClient) Start() error {
+	s.clientMtx.Lock()
+	defer s.clientMtx.Unlock()
+
 	if err := s.CS.Start(); err != nil {
 		return fmt.Errorf("error starting chain service: %v", err)
 	}
 
-	s.clientMtx.Lock()
-	defer s.clientMtx.Unlock()
 	if !s.started {
 		s.enqueueNotification = make(chan interface{})
 		s.dequeueNotification = make(chan interface{})
@@ -98,13 +99,11 @@ func (s *NeutrinoClient) Start() error {
 		s.quit = make(chan struct{})
 		s.started = true
 		s.wg.Add(1)
-		go func() {
-			select {
-			case s.enqueueNotification <- ClientConnected{}:
-			case <-s.quit:
-			}
-		}()
 		go s.notificationHandler()
+		select {
+		case s.enqueueNotification <- ClientConnected{}:
+		case <-s.quit:
+		}
 	}
 	return nil
 }
