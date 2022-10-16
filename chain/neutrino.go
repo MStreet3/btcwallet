@@ -74,6 +74,7 @@ func NewNeutrinoClient(chainParams *chaincfg.Params,
 	return &NeutrinoClient{
 		CS:           chainService,
 		chainParams:  chainParams,
+		rescanErr:    make(chan error, 1),
 		rescanQuitCh: make(chan chan struct{}, 1),
 		rescannerCh:  make(chan Rescanner, 1),
 	}
@@ -472,32 +473,6 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	return nil
 }
 
-// consumeRescanErr forwards errors from the rescan goroutine to the client
-func (s *NeutrinoClient) consumeRescanErr(
-	rescanQuit <-chan struct{},
-	errCh <-chan error,
-) {
-	for {
-		select {
-		case <-s.quit:
-			return
-		case <-rescanQuit:
-			return
-		case err, open := <-errCh:
-			if !open {
-				return
-			}
-			select {
-			case s.rescanErr <- err:
-			case <-s.quit:
-				return
-			case <-rescanQuit:
-				return
-			}
-		}
-	}
-}
-
 // createRescanner is a convenience method to consistently recreate a rescanner
 func (s *NeutrinoClient) createRescanner(opts ...neutrino.RescanOption) {
 	var (
@@ -547,6 +522,32 @@ func (s *NeutrinoClient) createRescanner(opts ...neutrino.RescanOption) {
 		defer s.wg.Done()
 		s.consumeRescanErr(rescanQuit, errCh)
 	}()
+}
+
+// consumeRescanErr forwards errors from the rescan goroutine to the client
+func (s *NeutrinoClient) consumeRescanErr(
+	rescanQuit <-chan struct{},
+	errCh <-chan error,
+) {
+	for {
+		select {
+		case <-s.quit:
+			return
+		case <-rescanQuit:
+			return
+		case err, open := <-errCh:
+			if !open {
+				return
+			}
+			select {
+			case s.rescanErr <- err:
+			case <-s.quit:
+				return
+			case <-rescanQuit:
+				return
+			}
+		}
+	}
 }
 
 // Notifications replicates the RPC client's Notifications method.
