@@ -2,6 +2,7 @@ package chain
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,25 +13,27 @@ import (
 // TestNeutrinoClientSequentialStartStop ensures that the client
 // can sequentially Start and Stop without errors or races.
 func TestNeutrinoClientSequentialStartStop(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	t.Cleanup(cancel)
-	nc := newMockNeutrinoClient(t)
-	numRestarts := 5
+	var (
+		ctx, cancel   = context.WithTimeout(context.Background(), 1*time.Second)
+		nc            = newMockNeutrinoClient(t)
+		callStartStop = func() <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				err := nc.Start()
+				require.NoError(t, err)
+				nc.Stop()
+				nc.WaitForShutdown()
+			}()
+			return done
+		}
+		numRestarts = 5
+	)
 
-	startStop := func() <-chan struct{} {
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			err := nc.Start()
-			require.NoError(t, err)
-			nc.Stop()
-			nc.WaitForShutdown()
-		}()
-		return done
-	}
+	t.Cleanup(cancel)
 
 	for i := 0; i < numRestarts; i++ {
-		done := startStop()
+		done := callStartStop()
 		select {
 		case <-ctx.Done():
 			t.Fatal("timed out")
@@ -46,7 +49,7 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 	var (
 		ctx, cancel             = context.WithTimeout(context.Background(), 1*time.Second)
 		addrs                   []btcutil.Address
-		sent                    = make(chan struct{})
+		done                    = make(chan struct{})
 		nc                      = newMockNeutrinoClient(t)
 		wantNotifyReceivedCalls = 4
 		wantUpdateCalls         = wantNotifyReceivedCalls - 1
@@ -54,18 +57,18 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 	t.Cleanup(cancel)
 
 	go func() {
-		defer close(sent)
+		defer close(done)
 		for i := 0; i < wantNotifyReceivedCalls; i++ {
 			err := nc.NotifyReceived(addrs)
 			require.NoError(t, err)
 		}
 	}()
 
-	// wait for call to Update or test failure
+	// wait for all calls to complete or test failure
 	select {
 	case <-ctx.Done():
 		t.Fatal("timed out")
-	case <-sent:
+	case <-done:
 		rescanner := <-nc.rescannerCh
 		mockRescan := rescanner.(*mockRescanner)
 		require.Equal(t, wantUpdateCalls, mockRescan.updateArgs.Len())
@@ -77,19 +80,23 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 	var (
 		ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+		wg          sync.WaitGroup
 		addrs       []btcutil.Address
 		startHash   = testBestBlock.Hash
-		sent        = make(chan struct{})
+		done        = make(chan struct{})
 		nc          = newMockNeutrinoClient(t)
 		callRescan  = func() {
+			defer wg.Done()
 			rerr := nc.Rescan(&startHash, addrs, nil)
 			require.NoError(t, rerr)
 		}
 		callNotifyReceived = func() {
+			defer wg.Done()
 			err := nc.NotifyReceived(addrs)
 			require.NoError(t, err)
 		}
 		callNotifyBlocks = func() {
+			defer wg.Done()
 			err := nc.NotifyBlocks()
 			require.NoError(t, err)
 		}
@@ -98,11 +105,15 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 
 	t.Cleanup(cancel)
 
+	// start the client
 	err := nc.Start()
 	require.NoError(t, err)
 
+	// launch wantRoutines, wait for them to finish and signal all done
+	wg.Add(wantRoutines)
 	go func() {
-		defer close(sent)
+		defer close(done)
+		defer wg.Wait()
 		for i := 0; i < wantRoutines; i++ {
 			if i%3 == 0 {
 				go callRescan()
@@ -118,9 +129,10 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 		}
 	}()
 
+	// wait for all calls to complete or test failure
 	select {
 	case <-ctx.Done():
 		t.Fatal("timed out")
-	case <-sent:
+	case <-done:
 	}
 }
