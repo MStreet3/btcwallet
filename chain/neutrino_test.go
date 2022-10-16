@@ -82,11 +82,11 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 // do not result in a data race and that there is no panic on replacing the Rescanner.
 func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 	var (
-		ctx, cancel             = context.WithTimeout(context.Background(), 1*time.Second)
-		addrs                   []btcutil.Address
-		sent                    = make(chan struct{})
-		nc                      = newMockNeutrinoClient(t)
-		wantNotifyReceivedCalls = 4
+		ctx, cancel  = context.WithTimeout(context.Background(), 1*time.Second)
+		addrs        []btcutil.Address
+		sent         = make(chan struct{})
+		nc           = newMockNeutrinoClient(t)
+		wantRoutines = 100
 	)
 
 	t.Cleanup(cancel)
@@ -96,10 +96,18 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 
 	go func() {
 		defer close(sent)
-		for i := 0; i < wantNotifyReceivedCalls; i++ {
-			err := nc.NotifyReceived(addrs)
-			require.NoError(t, err)
-			require.True(t, nc.scanning)
+		for i := 0; i < wantRoutines; i++ {
+			if i%3 == 0 {
+				go func() {
+					rerr := nc.Rescan(nil, addrs, nil)
+					require.NoError(t, rerr)
+				}()
+			}
+			go func() {
+				err := nc.NotifyReceived(addrs)
+				require.NoError(t, err)
+				require.True(t, nc.scanning)
+			}()
 		}
 	}()
 
