@@ -47,12 +47,10 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 		ctx, cancel             = context.WithTimeout(context.Background(), 1*time.Second)
 		addrs                   []btcutil.Address
 		sent                    = make(chan struct{})
-		read                    = make(chan struct{})
 		called                  = make(chan struct{})
 		nc                      = newMockNeutrinoClient(t)
 		wantNotifyReceivedCalls = 4
 		wantUpdateCalls         = wantNotifyReceivedCalls - 1
-		gotUC                   = 0
 	)
 	t.Cleanup(cancel)
 
@@ -70,29 +68,44 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 		}
 	}()
 
-	// wait until called, then type cast and read from private channel
-	<-called
-	mockRescan := nc.rescan.(*mockRescanner)
-	go func() {
-		defer close(read)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-mockRescan.updateCh:
-				gotUC++
-				if gotUC == wantUpdateCalls {
-					return
-				}
-			}
-		}
-	}()
-
 	// wait for call to Update or test failure
 	select {
 	case <-ctx.Done():
 		t.Fatal("timed out")
-	case <-read:
-		require.Equal(t, wantUpdateCalls, gotUC)
+	case <-sent:
+		mockRescan := nc.rescan.(*mockRescanner)
+		require.Equal(t, wantUpdateCalls, mockRescan.updateArgs.Len())
+	}
+}
+
+// TestNeutrinoClientNotifyReceivedRescan verifies concurrent calls to NotifyReceived and Rescan
+// do not result in a data race and that there is no panic on replacing the Rescanner.
+func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
+	var (
+		ctx, cancel             = context.WithTimeout(context.Background(), 1*time.Second)
+		addrs                   []btcutil.Address
+		sent                    = make(chan struct{})
+		nc                      = newMockNeutrinoClient(t)
+		wantNotifyReceivedCalls = 4
+	)
+
+	t.Cleanup(cancel)
+
+	err := nc.Start()
+	require.NoError(t, err)
+
+	go func() {
+		defer close(sent)
+		for i := 0; i < wantNotifyReceivedCalls; i++ {
+			err := nc.NotifyReceived(addrs)
+			require.NoError(t, err)
+			require.True(t, nc.scanning)
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("timed out")
+	case <-sent:
 	}
 }

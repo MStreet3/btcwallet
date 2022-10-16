@@ -57,7 +57,7 @@ type NeutrinoClient struct {
 
 	quit       chan struct{}
 	rescanQuit chan struct{}
-	rescanErr  <-chan error
+	rescanErr  chan error
 	wg         sync.WaitGroup
 	started    bool
 	scanning   bool
@@ -435,7 +435,12 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		neutrino.WatchAddrs(addrs...),
 		neutrino.WatchInputs(inputsToWatch...),
 	)
-	s.rescanErr = s.rescan.Start()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.consumeRescanErr(s.rescanQuit, s.rescan.Start())
+	}()
 
 	return nil
 }
@@ -487,9 +492,38 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		neutrino.QuitChan(s.rescanQuit),
 		neutrino.WatchAddrs(addrs...),
 	)
-	s.rescanErr = s.rescan.Start()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.consumeRescanErr(s.rescanQuit, s.rescan.Start())
+	}()
 
 	return nil
+}
+
+// consumeRescanErr forwards errors from the rescan goroutine to the client
+func (s *NeutrinoClient) consumeRescanErr(stop <-chan struct{},
+	errCh <-chan error) {
+	for {
+		select {
+		case <-s.quit:
+			return
+		case <-stop:
+			return
+		case err, open := <-errCh:
+			if !open {
+				return
+			}
+			select {
+			case s.rescanErr <- err:
+			case <-s.quit:
+				return
+			case <-stop:
+				return
+			}
+		}
+	}
 }
 
 // Notifications replicates the RPC client's Notifications method.

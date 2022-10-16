@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"container/list"
 	"errors"
 	"testing"
 
@@ -29,7 +30,7 @@ func newMockNeutrinoClient(t *testing.T) *NeutrinoClient {
 		chainSvc     = &mockChainService{}
 		newRescanner = func(ro ...neutrino.RescanOption) Rescanner {
 			return &mockRescanner{
-				make(chan []neutrino.UpdateOption),
+				updateArgs: list.New(),
 			}
 		}
 	)
@@ -41,7 +42,7 @@ func newMockNeutrinoClient(t *testing.T) *NeutrinoClient {
 }
 
 type mockRescanner struct {
-	updateCh chan []neutrino.UpdateOption
+	updateArgs *list.List
 }
 
 func (m *mockRescanner) Start() <-chan error {
@@ -53,7 +54,7 @@ func (m *mockRescanner) WaitForShutdown() {
 }
 
 func (m *mockRescanner) Update(opts ...neutrino.UpdateOption) error {
-	m.updateCh <- opts
+	m.updateArgs.PushBack(opts)
 	return nil
 }
 
