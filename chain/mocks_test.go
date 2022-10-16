@@ -27,8 +27,10 @@ func newMockNeutrinoClient(t *testing.T) *NeutrinoClient {
 	var (
 		chainParams  = &chaincfg.Params{}
 		chainSvc     = &mockChainService{}
-		newRescanner = func(cs neutrino.ChainSource, ro ...neutrino.RescanOption) Rescanner {
-			return &mockRescanner{}
+		newRescanner = func(ro ...neutrino.RescanOption) Rescanner {
+			return &mockRescanner{
+				make(chan []neutrino.UpdateOption),
+			}
 		}
 	)
 	return &NeutrinoClient{
@@ -38,18 +40,21 @@ func newMockNeutrinoClient(t *testing.T) *NeutrinoClient {
 	}
 }
 
-type mockRescanner struct{}
+type mockRescanner struct {
+	updateCh chan []neutrino.UpdateOption
+}
 
 func (m *mockRescanner) Start() <-chan error {
-	return nil
+	return make(<-chan error)
 }
 
 func (m *mockRescanner) WaitForShutdown() {
-	panic(ErrNotImplemented)
+	// no-op
 }
 
-func (m *mockRescanner) Update(...neutrino.UpdateOption) error {
-	return ErrNotImplemented
+func (m *mockRescanner) Update(opts ...neutrino.UpdateOption) error {
+	m.updateCh <- opts
+	return nil
 }
 
 type mockChainService struct{}

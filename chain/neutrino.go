@@ -46,7 +46,7 @@ type NeutrinoClient struct {
 
 	// We currently support one rescan/notifiction goroutine per client
 	rescan       Rescanner
-	newRescanner func(neutrino.ChainSource, ...neutrino.RescanOption) Rescanner
+	newRescanner func(...neutrino.RescanOption) Rescanner
 
 	enqueueNotification     chan interface{}
 	dequeueNotification     chan interface{}
@@ -88,23 +88,30 @@ func (s *NeutrinoClient) Start() error {
 	s.clientMtx.Lock()
 	defer s.clientMtx.Unlock()
 
+	// attempt to start the chain service
 	if err := s.CS.Start(); err != nil {
 		return fmt.Errorf("error starting chain service: %v", err)
 	}
 
 	if !s.started {
+		// restart the client state
 		s.enqueueNotification = make(chan interface{})
 		s.dequeueNotification = make(chan interface{})
 		s.currentBlock = make(chan *waddrmgr.BlockStamp)
 		s.quit = make(chan struct{})
 		s.started = true
+
+		// launch the notification handler
 		s.wg.Add(1)
 		go s.notificationHandler()
+
+		// place the client connected notification into the queue
 		select {
 		case s.enqueueNotification <- ClientConnected{}:
 		case <-s.quit:
 		}
 	}
+
 	return nil
 }
 
@@ -112,9 +119,11 @@ func (s *NeutrinoClient) Start() error {
 func (s *NeutrinoClient) Stop() {
 	s.clientMtx.Lock()
 	defer s.clientMtx.Unlock()
+
 	if !s.started {
 		return
 	}
+
 	close(s.quit)
 	s.started = false
 }
@@ -415,15 +424,11 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 
 	newRescanner := s.getNewRescanner()
 
-	s.rescan = newRescanner(
-		&neutrino.RescanChainSource{
-			ChainService: s.CS.(*neutrino.ChainService),
-		},
-		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
-			OnBlockConnected:         s.onBlockConnected,
-			OnFilteredBlockConnected: s.onFilteredBlockConnected,
-			OnBlockDisconnected:      s.onBlockDisconnected,
-		}),
+	s.rescan = newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+		OnBlockConnected:         s.onBlockConnected,
+		OnFilteredBlockConnected: s.onFilteredBlockConnected,
+		OnBlockDisconnected:      s.onBlockDisconnected,
+	}),
 		neutrino.StartBlock(&headerfs.BlockStamp{Hash: *startHash}),
 		neutrino.StartTime(s.startTime),
 		neutrino.QuitChan(s.rescanQuit),
@@ -450,6 +455,8 @@ func (s *NeutrinoClient) NotifyBlocks() error {
 }
 
 // NotifyReceived replicates the RPC client's NotifyReceived command.
+//
+// TODO(mstreet3) error if the client is not started?
 func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	s.clientMtx.Lock()
 	defer s.clientMtx.Unlock()
@@ -471,15 +478,11 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	// Rescan with just the specified addresses.
 	newRescanner := s.getNewRescanner()
 
-	s.rescan = newRescanner(
-		&neutrino.RescanChainSource{
-			ChainService: s.CS.(*neutrino.ChainService),
-		},
-		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
-			OnBlockConnected:         s.onBlockConnected,
-			OnFilteredBlockConnected: s.onFilteredBlockConnected,
-			OnBlockDisconnected:      s.onBlockDisconnected,
-		}),
+	s.rescan = newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+		OnBlockConnected:         s.onBlockConnected,
+		OnFilteredBlockConnected: s.onFilteredBlockConnected,
+		OnBlockDisconnected:      s.onBlockDisconnected,
+	}),
 		neutrino.StartTime(s.startTime),
 		neutrino.QuitChan(s.rescanQuit),
 		neutrino.WatchAddrs(addrs...),
@@ -759,9 +762,12 @@ out:
 
 // getNewRescanner injects the Rescanner constructor when called and defaults to using neutrino.NewRescan
 // when unspecified.
-func (s *NeutrinoClient) getNewRescanner() func(neutrino.ChainSource, ...neutrino.RescanOption) Rescanner {
+func (s *NeutrinoClient) getNewRescanner() func(...neutrino.RescanOption) Rescanner {
 	if s.newRescanner == nil {
-		s.newRescanner = func(cs neutrino.ChainSource, ropts ...neutrino.RescanOption) Rescanner {
+		s.newRescanner = func(ropts ...neutrino.RescanOption) Rescanner {
+			cs := &neutrino.RescanChainSource{
+				ChainService: s.CS.(*neutrino.ChainService),
+			}
 			return neutrino.NewRescan(cs, ropts...)
 		}
 	}
