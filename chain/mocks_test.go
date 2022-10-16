@@ -23,15 +23,19 @@ var (
 	}
 )
 
-func newMockNeutrinoClient(t *testing.T) *NeutrinoClient {
+func newMockNeutrinoClient(t *testing.T, opts ...func(*mockRescanner)) *NeutrinoClient {
 	t.Helper()
 	var (
 		chainParams  = &chaincfg.Params{}
 		chainSvc     = &mockChainService{}
 		newRescanner = func(ro ...neutrino.RescanOption) Rescanner {
-			return &mockRescanner{
+			mrs := &mockRescanner{
 				updateArgs: list.New(),
 			}
+			for _, o := range opts {
+				o(mrs)
+			}
+			return mrs
 		}
 	)
 	return &NeutrinoClient{
@@ -45,10 +49,24 @@ func newMockNeutrinoClient(t *testing.T) *NeutrinoClient {
 
 type mockRescanner struct {
 	updateArgs *list.List
+	errs       []error
+	rescanQuit <-chan struct{}
 }
 
 func (m *mockRescanner) Start() <-chan error {
-	return make(<-chan error)
+	errs := make(chan error)
+	go func() {
+		defer close(errs)
+		for _, err := range m.errs {
+			err := err
+			select {
+			case <-m.rescanQuit:
+				return
+			case errs <- err:
+			}
+		}
+	}()
+	return errs
 }
 
 func (m *mockRescanner) WaitForShutdown() {

@@ -376,23 +376,10 @@ func (s *NeutrinoClient) Rescan(
 			"is not started")
 	}
 
-	select {
-	case rescanner := <-s.rescannerCh:
-		// rescanner is running, kill it before starting a new one
-		ch := <-s.rescanQuitCh
-		close(ch)
-		rescanner.WaitForShutdown()
-	default:
-		// no rescanner exists, just create a new one
+	inputsToWatch, err := toInputsToWatch(outPoints)
+	if err != nil {
+		return err
 	}
-
-	rescanQuit := make(chan struct{})
-	s.rescanQuitCh <- rescanQuit
-
-	s.finished = false
-	s.lastProgressSent = false
-	s.lastFilteredBlockHeader = nil
-	s.isRescan = true
 
 	bestBlock, err := s.CS.BestBlock()
 	if err != nil {
@@ -405,12 +392,25 @@ func (s *NeutrinoClient) Rescan(
 			bestBlock.Hash, err)
 	}
 
+	select {
+	case rescanner := <-s.rescannerCh:
+		// rescanner is running, kill it before starting a new one
+		rescanQuit := <-s.rescanQuitCh
+		close(rescanQuit)
+		rescanner.WaitForShutdown()
+	default:
+		// no rescanner exists, update client state then create a new one
+	}
+
+	s.finished = header.BlockHash() == *startHash
+	s.lastProgressSent = false
+	s.lastFilteredBlockHeader = nil
+	s.isRescan = true
+
 	// If the wallet is already fully caught up, or the rescan has started
 	// with state that indicates a "fresh" wallet, we'll send a
 	// notification indicating the rescan has "finished".
-	if header.BlockHash() == *startHash {
-		s.finished = true
-
+	if s.finished {
 		select {
 		case s.enqueueNotification <- &RescanFinished{
 			Hash:   startHash,
@@ -422,45 +422,11 @@ func (s *NeutrinoClient) Rescan(
 		}
 	}
 
-	inputsToWatch, err := toInputsToWatch(outPoints)
-	if err != nil {
-		return err
-	}
-
-	newRescanner := s.getNewRescanner()
-
-	// make closures to use as handlers
-	obc := func(hash *chainhash.Hash, height int32, time time.Time) {
-		s.onBlockConnected(rescanQuit, hash, height, time)
-	}
-
-	ofbc := func(height int32, header *wire.BlockHeader, txs []*btcutil.Tx) {
-		s.onFilteredBlockConnected(rescanQuit, height, header, txs)
-	}
-
-	obd := func(hash *chainhash.Hash, height int32, time time.Time) {
-		s.onBlockDisconnected(rescanQuit, hash, height, time)
-	}
-
-	rescanner := newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
-		OnBlockConnected:         obc,
-		OnFilteredBlockConnected: ofbc,
-		OnBlockDisconnected:      obd,
-	}),
+	s.createRescanner(
 		neutrino.StartBlock(&headerfs.BlockStamp{Hash: *startHash}),
-		neutrino.StartTime(s.startTime),
-		neutrino.QuitChan(rescanQuit),
 		neutrino.WatchAddrs(addrs...),
 		neutrino.WatchInputs(inputsToWatch...),
 	)
-
-	s.rescannerCh <- rescanner
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.consumeRescanErr(rescanQuit, rescanner.Start())
-	}()
 
 	return nil
 }
@@ -493,11 +459,8 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		s.rescannerCh <- rescanner
 		return err
 	default:
-		// rescanner is not running, create a rescanner
+		// no rescanner exists, update client state then create a new one
 	}
-
-	rescanQuit := make(chan struct{})
-	s.rescanQuitCh <- rescanQuit
 
 	// Don't need RescanFinished or RescanProgress notifications.
 	s.finished = true
@@ -505,39 +468,7 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	s.lastFilteredBlockHeader = nil
 
 	// Rescan with just the specified addresses.
-	newRescanner := s.getNewRescanner()
-
-	// make closures to use as handlers
-	obc := func(hash *chainhash.Hash, height int32, time time.Time) {
-		s.onBlockConnected(rescanQuit, hash, height, time)
-	}
-
-	ofbc := func(height int32, header *wire.BlockHeader, txs []*btcutil.Tx) {
-		s.onFilteredBlockConnected(rescanQuit, height, header, txs)
-	}
-
-	obd := func(hash *chainhash.Hash, height int32, time time.Time) {
-		s.onBlockDisconnected(rescanQuit, hash, height, time)
-	}
-
-	rescanner := newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
-		OnBlockConnected:         obc,
-		OnFilteredBlockConnected: ofbc,
-		OnBlockDisconnected:      obd,
-	}),
-		neutrino.StartTime(s.startTime),
-		neutrino.QuitChan(rescanQuit),
-		neutrino.WatchAddrs(addrs...),
-	)
-
-	s.rescannerCh <- rescanner
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.consumeRescanErr(rescanQuit, rescanner.Start())
-	}()
-
+	s.createRescanner(neutrino.WatchAddrs(addrs...))
 	return nil
 }
 
@@ -565,6 +496,57 @@ func (s *NeutrinoClient) consumeRescanErr(
 			}
 		}
 	}
+}
+
+// createRescanner is a convenience method to consistently recreate a rescanner
+func (s *NeutrinoClient) createRescanner(opts ...neutrino.RescanOption) {
+	var (
+		rescanQuit   = make(chan struct{}) // create a quit channel for the new rescanner
+		newRescanner = s.getNewRescanner() // inject a constructor
+
+		// wrap the quit channel inside closures to use as handlers
+		obc = func(hash *chainhash.Hash, height int32, time time.Time) {
+			s.onBlockConnected(rescanQuit, hash, height, time)
+		}
+
+		ofbc = func(height int32, header *wire.BlockHeader, txs []*btcutil.Tx) {
+			s.onFilteredBlockConnected(rescanQuit, height, header, txs)
+		}
+
+		obd = func(hash *chainhash.Hash, height int32, time time.Time) {
+			s.onBlockDisconnected(rescanQuit, hash, height, time)
+		}
+
+		// build default options for the rescanner
+		defaultOpts = []neutrino.RescanOption{
+			neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+				OnBlockConnected:         obc,
+				OnFilteredBlockConnected: ofbc,
+				OnBlockDisconnected:      obd,
+			}),
+			neutrino.StartTime(s.startTime),
+			neutrino.QuitChan(rescanQuit),
+		}
+		fullOpts = append(opts, defaultOpts...)
+	)
+
+	// construct the rescanner, start it and broadcast the new objects via
+	// sends on their respective channels
+	rescanner := newRescanner(fullOpts...)
+
+	s.rescannerCh <- rescanner
+	s.rescanQuitCh <- rescanQuit
+
+	// start the rescanner after it is sucessfully sent, sending is blocked
+	// if there exists a rescanner already
+	errCh := rescanner.Start()
+
+	// start a goroutine to consume any errors and broadcast them on s.rescanErr
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.consumeRescanErr(rescanQuit, errCh)
+	}()
 }
 
 // Notifications replicates the RPC client's Notifications method.
