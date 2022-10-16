@@ -68,8 +68,10 @@ type NeutrinoClient struct {
 
 // NewNeutrinoClient creates a new NeutrinoClient struct with a backing
 // ChainService.
-func NewNeutrinoClient(chainParams *chaincfg.Params,
-	chainService *neutrino.ChainService) *NeutrinoClient {
+func NewNeutrinoClient(
+	chainParams *chaincfg.Params,
+	chainService *neutrino.ChainService,
+) *NeutrinoClient {
 
 	return &NeutrinoClient{
 		CS:           chainService,
@@ -395,12 +397,15 @@ func (s *NeutrinoClient) Rescan(
 
 	select {
 	case rescanner := <-s.rescannerCh:
-		// rescanner is running, kill it before starting a new one
+		// rescanner is running, get its signal channel
 		rescanQuit := <-s.rescanQuitCh
+
+		// close signal channel to initialize shutdown of rescanner, all dependent handlers
+		// and error consumer
 		close(rescanQuit)
 		rescanner.WaitForShutdown()
 	default:
-		// no rescanner exists, update client state then create a new one
+		// no rescanner exists, update client state then create a new rescanner
 	}
 
 	s.finished = header.BlockHash() == *startHash
@@ -409,8 +414,7 @@ func (s *NeutrinoClient) Rescan(
 	s.isRescan = true
 
 	// If the wallet is already fully caught up, or the rescan has started
-	// with state that indicates a "fresh" wallet, we'll send a
-	// notification indicating the rescan has "finished".
+	// with the best block, we'll send a notification indicating the rescan has "finished".
 	if s.finished {
 		select {
 		case s.enqueueNotification <- &RescanFinished{
@@ -505,15 +509,14 @@ func (s *NeutrinoClient) createRescanner(opts ...neutrino.RescanOption) {
 		fullOpts = append(opts, defaultOpts...)
 	)
 
-	// construct the rescanner, start it and broadcast the new objects via
-	// sends on their respective channels
+	// construct the rescanner
 	rescanner := newRescanner(fullOpts...)
 
+	// broadcast the new objects via sends on their respective channels
 	s.rescannerCh <- rescanner
 	s.rescanQuitCh <- rescanQuit
 
-	// start the rescanner after it is sucessfully sent, sending is blocked
-	// if there exists a rescanner already
+	// only start the rescanner after it is sucessfully broadcast
 	errCh := rescanner.Start()
 
 	// start a goroutine to consume any errors and broadcast them on s.rescanErr
@@ -524,7 +527,9 @@ func (s *NeutrinoClient) createRescanner(opts ...neutrino.RescanOption) {
 	}()
 }
 
-// consumeRescanErr forwards errors from the rescan goroutine to the client
+// consumeRescanErr forwards errors from the rescan goroutine to the client.  stops sending errors
+// when either the client signals to quit, the rescanner associated with the error channel is
+// shutdown or the channel of errors is closed.
 func (s *NeutrinoClient) consumeRescanErr(
 	rescanQuit <-chan struct{},
 	errCh <-chan error,
@@ -841,6 +846,7 @@ func (s *NeutrinoClient) getNewRescanner() func(...neutrino.RescanOption) Rescan
 	return s.newRescanner
 }
 
+// toInputsToWatch transforms an address map into an array of inputs with script
 func toInputsToWatch(ops map[wire.OutPoint]btcutil.Address) ([]neutrino.InputWithScript, error) {
 	inputsToWatch := make([]neutrino.InputWithScript, 0, len(ops))
 	for op, addr := range ops {

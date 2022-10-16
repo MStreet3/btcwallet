@@ -85,21 +85,25 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 		startHash   = testBestBlock.Hash
 		done        = make(chan struct{})
 		nc          = newMockNeutrinoClient(t)
-		callRescan  = func() {
+
+		callRescan = func() {
 			defer wg.Done()
 			rerr := nc.Rescan(&startHash, addrs, nil)
 			require.NoError(t, rerr)
 		}
+
 		callNotifyReceived = func() {
 			defer wg.Done()
 			err := nc.NotifyReceived(addrs)
 			require.NoError(t, err)
 		}
+
 		callNotifyBlocks = func() {
 			defer wg.Done()
 			err := nc.NotifyBlocks()
 			require.NoError(t, err)
 		}
+
 		wantRoutines = 100
 	)
 
