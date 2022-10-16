@@ -90,7 +90,7 @@ func (m *mockChainService) GetBlockHash(int64) (*chainhash.Hash, error) {
 }
 
 func (m *mockChainService) GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, error) {
-	return nil, ErrNotImplemented
+	return &wire.BlockHeader{}, nil
 }
 
 func (m *mockChainService) IsCurrent() bool {

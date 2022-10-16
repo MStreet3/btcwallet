@@ -47,7 +47,6 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 		ctx, cancel             = context.WithTimeout(context.Background(), 1*time.Second)
 		addrs                   []btcutil.Address
 		sent                    = make(chan struct{})
-		called                  = make(chan struct{})
 		nc                      = newMockNeutrinoClient(t)
 		wantNotifyReceivedCalls = 4
 		wantUpdateCalls         = wantNotifyReceivedCalls - 1
@@ -59,11 +58,6 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 		for i := 0; i < wantNotifyReceivedCalls; i++ {
 			err := nc.NotifyReceived(addrs)
 			require.NoError(t, err)
-
-			// signal that NotifyReceived was called on first iteration
-			if i == 0 {
-				close(called)
-			}
 		}
 	}()
 
@@ -82,10 +76,23 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 // do not result in a data race and that there is no panic on replacing the Rescanner.
 func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 	var (
-		ctx, cancel  = context.WithTimeout(context.Background(), 1*time.Second)
-		addrs        []btcutil.Address
-		sent         = make(chan struct{})
-		nc           = newMockNeutrinoClient(t)
+		ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+		addrs       []btcutil.Address
+		startHash   = testBestBlock.Hash
+		sent        = make(chan struct{})
+		nc          = newMockNeutrinoClient(t)
+		callRescan  = func() {
+			rerr := nc.Rescan(&startHash, addrs, nil)
+			require.NoError(t, rerr)
+		}
+		callNotifyReceived = func() {
+			err := nc.NotifyReceived(addrs)
+			require.NoError(t, err)
+		}
+		callNotifyBlocks = func() {
+			err := nc.NotifyBlocks()
+			require.NoError(t, err)
+		}
 		wantRoutines = 100
 	)
 
@@ -98,15 +105,16 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 		defer close(sent)
 		for i := 0; i < wantRoutines; i++ {
 			if i%3 == 0 {
-				go func() {
-					rerr := nc.Rescan(nil, addrs, nil)
-					require.NoError(t, rerr)
-				}()
+				go callRescan()
+				continue
 			}
-			go func() {
-				err := nc.NotifyReceived(addrs)
-				require.NoError(t, err)
-			}()
+
+			if i%10 == 0 {
+				go callNotifyBlocks()
+				continue
+			}
+
+			go callNotifyReceived()
 		}
 	}()
 

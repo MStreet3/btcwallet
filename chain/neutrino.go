@@ -46,6 +46,9 @@ type NeutrinoClient struct {
 
 	// We currently support one rescan/notifiction goroutine per client
 	newRescanner func(...neutrino.RescanOption) Rescanner
+	rescanQuitCh chan (chan struct{})
+	rescannerCh  chan Rescanner
+	rescanErr    chan error
 
 	enqueueNotification     chan interface{}
 	dequeueNotification     chan interface{}
@@ -54,14 +57,11 @@ type NeutrinoClient struct {
 	lastFilteredBlockHeader *wire.BlockHeader
 	currentBlock            chan *waddrmgr.BlockStamp
 
-	quit         chan struct{}
-	rescanQuitCh chan (chan struct{})
-	rescannerCh  chan Rescanner
-	rescanErr    chan error
-	wg           sync.WaitGroup
-	started      bool
-	finished     bool
-	isRescan     bool
+	quit     chan struct{}
+	wg       sync.WaitGroup
+	started  bool
+	finished bool
+	isRescan bool
 
 	clientMtx sync.Mutex
 }
@@ -483,6 +483,9 @@ func (s *NeutrinoClient) NotifyBlocks() error {
 //
 // TODO(mstreet3) error if the client is not started?
 func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
+	s.clientMtx.Lock()
+	defer s.clientMtx.Unlock()
+
 	select {
 	case rescanner := <-s.rescannerCh:
 		// rescanner is running, update the watch list and put it back.
@@ -497,11 +500,9 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	s.rescanQuitCh <- rescanQuit
 
 	// Don't need RescanFinished or RescanProgress notifications.
-	s.clientMtx.Lock()
 	s.finished = true
 	s.lastProgressSent = true
 	s.lastFilteredBlockHeader = nil
-	s.clientMtx.Unlock()
 
 	// Rescan with just the specified addresses.
 	newRescanner := s.getNewRescanner()
@@ -541,13 +542,15 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 }
 
 // consumeRescanErr forwards errors from the rescan goroutine to the client
-func (s *NeutrinoClient) consumeRescanErr(stop <-chan struct{},
-	errCh <-chan error) {
+func (s *NeutrinoClient) consumeRescanErr(
+	rescanQuit <-chan struct{},
+	errCh <-chan error,
+) {
 	for {
 		select {
 		case <-s.quit:
 			return
-		case <-stop:
+		case <-rescanQuit:
 			return
 		case err, open := <-errCh:
 			if !open {
@@ -557,7 +560,7 @@ func (s *NeutrinoClient) consumeRescanErr(stop <-chan struct{},
 			case s.rescanErr <- err:
 			case <-s.quit:
 				return
-			case <-stop:
+			case <-rescanQuit:
 				return
 			}
 		}
@@ -584,9 +587,12 @@ func (s *NeutrinoClient) SetStartTime(startTime time.Time) {
 
 // onFilteredBlockConnected sends appropriate notifications to the notification
 // channel.
-func (s *NeutrinoClient) onFilteredBlockConnected(rescanQuit <-chan struct{},
+func (s *NeutrinoClient) onFilteredBlockConnected(
+	rescanQuit <-chan struct{},
 	height int32,
-	header *wire.BlockHeader, relevantTxs []*btcutil.Tx) {
+	header *wire.BlockHeader,
+	relevantTxs []*btcutil.Tx,
+) {
 	ntfn := FilteredBlockConnected{
 		Block: &wtxmgr.BlockMeta{
 			Block: wtxmgr.Block{
@@ -626,9 +632,11 @@ func (s *NeutrinoClient) onFilteredBlockConnected(rescanQuit <-chan struct{},
 
 // onBlockDisconnected sends appropriate notifications to the notification
 // channel.
-func (s *NeutrinoClient) onBlockDisconnected(rescanQuit <-chan struct{},
+func (s *NeutrinoClient) onBlockDisconnected(
+	rescanQuit <-chan struct{},
 	hash *chainhash.Hash, height int32,
-	t time.Time) {
+	t time.Time,
+) {
 	select {
 	case s.enqueueNotification <- BlockDisconnected{
 		Block: wtxmgr.Block{
@@ -642,11 +650,11 @@ func (s *NeutrinoClient) onBlockDisconnected(rescanQuit <-chan struct{},
 	}
 }
 
-func (s *NeutrinoClient) onBlockConnected(rescanQuit <-chan struct{},
+func (s *NeutrinoClient) onBlockConnected(
+	rescanQuit <-chan struct{},
 	hash *chainhash.Hash, height int32,
-	time time.Time) {
-	// TODO: Move this closure out and parameterize it? Is it useful
-	// outside here?
+	time time.Time,
+) {
 	sendRescanProgress := func() {
 		select {
 		case s.enqueueNotification <- &RescanProgress{
@@ -658,6 +666,7 @@ func (s *NeutrinoClient) onBlockConnected(rescanQuit <-chan struct{},
 		case <-rescanQuit:
 		}
 	}
+
 	// Only send BlockConnected notification if we're processing blocks
 	// before the birthday. Otherwise, we can just update using
 	// RescanProgress notifications.
