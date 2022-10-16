@@ -59,7 +59,6 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 		for i := 0; i < wantNotifyReceivedCalls; i++ {
 			err := nc.NotifyReceived(addrs)
 			require.NoError(t, err)
-			require.True(t, nc.scanning)
 
 			// signal that NotifyReceived was called on first iteration
 			if i == 0 {
@@ -73,7 +72,8 @@ func TestNeutrinoClientNotifyReceived(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out")
 	case <-sent:
-		mockRescan := nc.rescan.(*mockRescanner)
+		rescanner := <-nc.rescannerCh
+		mockRescan := rescanner.(*mockRescanner)
 		require.Equal(t, wantUpdateCalls, mockRescan.updateArgs.Len())
 	}
 }
@@ -106,7 +106,6 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 			go func() {
 				err := nc.NotifyReceived(addrs)
 				require.NoError(t, err)
-				require.True(t, nc.scanning)
 			}()
 		}
 	}()

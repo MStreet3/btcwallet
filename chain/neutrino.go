@@ -45,7 +45,6 @@ type NeutrinoClient struct {
 	chainParams *chaincfg.Params
 
 	// We currently support one rescan/notifiction goroutine per client
-	rescan       Rescanner
 	newRescanner func(...neutrino.RescanOption) Rescanner
 
 	enqueueNotification     chan interface{}
@@ -55,14 +54,14 @@ type NeutrinoClient struct {
 	lastFilteredBlockHeader *wire.BlockHeader
 	currentBlock            chan *waddrmgr.BlockStamp
 
-	quit       chan struct{}
-	rescanQuit chan (chan struct{})
-	rescanErr  chan error
-	wg         sync.WaitGroup
-	started    bool
-	scanning   bool
-	finished   bool
-	isRescan   bool
+	quit         chan struct{}
+	rescanQuitCh chan (chan struct{})
+	rescannerCh  chan Rescanner
+	rescanErr    chan error
+	wg           sync.WaitGroup
+	started      bool
+	finished     bool
+	isRescan     bool
 
 	clientMtx sync.Mutex
 }
@@ -73,9 +72,10 @@ func NewNeutrinoClient(chainParams *chaincfg.Params,
 	chainService *neutrino.ChainService) *NeutrinoClient {
 
 	return &NeutrinoClient{
-		CS:          chainService,
-		chainParams: chainParams,
-		rescanQuit:  make(chan chan struct{}, 1),
+		CS:           chainService,
+		chainParams:  chainParams,
+		rescanQuitCh: make(chan chan struct{}, 1),
+		rescannerCh:  make(chan Rescanner, 1),
 	}
 }
 
@@ -363,8 +363,11 @@ func (s *NeutrinoClient) pollCFilter(hash *chainhash.Hash) (*gcs.Filter, error) 
 }
 
 // Rescan replicates the RPC client's Rescan command.
-func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Address,
-	outPoints map[wire.OutPoint]btcutil.Address) error {
+func (s *NeutrinoClient) Rescan(
+	startHash *chainhash.Hash,
+	addrs []btcutil.Address,
+	outPoints map[wire.OutPoint]btcutil.Address,
+) error {
 	s.clientMtx.Lock()
 	defer s.clientMtx.Unlock()
 
@@ -373,18 +376,19 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 			"is not started")
 	}
 
-	if s.scanning {
-		// Restart the rescan by killing the existing rescan.
-		ch := <-s.rescanQuit
+	select {
+	case rescanner := <-s.rescannerCh:
+		// rescanner is running, kill it before starting a new one
+		ch := <-s.rescanQuitCh
 		close(ch)
-		s.rescan.WaitForShutdown()
-		s.rescan = nil
+		rescanner.WaitForShutdown()
+	default:
+		// no rescanner exists, just create a new one
 	}
 
 	rescanQuit := make(chan struct{})
-	s.rescanQuit <- rescanQuit
+	s.rescanQuitCh <- rescanQuit
 
-	s.scanning = true
 	s.finished = false
 	s.lastProgressSent = false
 	s.lastFilteredBlockHeader = nil
@@ -438,7 +442,7 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		s.onBlockDisconnected(rescanQuit, hash, height, time)
 	}
 
-	s.rescan = newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+	rescanner := newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 		OnBlockConnected:         obc,
 		OnFilteredBlockConnected: ofbc,
 		OnBlockDisconnected:      obd,
@@ -450,10 +454,12 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		neutrino.WatchInputs(inputsToWatch...),
 	)
 
+	s.rescannerCh <- rescanner
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.consumeRescanErr(rescanQuit, s.rescan.Start())
+		s.consumeRescanErr(rescanQuit, rescanner.Start())
 	}()
 
 	return nil
@@ -461,38 +467,41 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 
 // NotifyBlocks replicates the RPC client's NotifyBlocks command.
 func (s *NeutrinoClient) NotifyBlocks() error {
-	s.clientMtx.Lock()
-	defer s.clientMtx.Unlock()
-
-	// If we're scanning, we're already notifying on blocks. Otherwise,
-	// start a rescan without watching any addresses.
-	if !s.scanning {
-		return s.NotifyReceived([]btcutil.Address{})
+	select {
+	case rescanner := <-s.rescannerCh:
+		// rescanner is running, put it back and do nothing.  we're already notifying on blocks.
+		s.rescannerCh <- rescanner
+		return nil
+	default:
 	}
 
-	return nil
+	// Otherwise, start a rescan without watching any addresses.
+	return s.NotifyReceived([]btcutil.Address{})
 }
 
 // NotifyReceived replicates the RPC client's NotifyReceived command.
 //
 // TODO(mstreet3) error if the client is not started?
 func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
-	s.clientMtx.Lock()
-	defer s.clientMtx.Unlock()
-
-	// If we have a rescan running, we just need to add the appropriate
-	// addresses to the watch list.
-	if s.scanning {
-		return s.rescan.Update(neutrino.AddAddrs(addrs...))
+	select {
+	case rescanner := <-s.rescannerCh:
+		// rescanner is running, update the watch list and put it back.
+		err := rescanner.Update(neutrino.AddAddrs(addrs...))
+		s.rescannerCh <- rescanner
+		return err
+	default:
+		// rescanner is not running, create a rescanner
 	}
 
 	rescanQuit := make(chan struct{})
-	s.rescanQuit <- rescanQuit
+	s.rescanQuitCh <- rescanQuit
 
 	// Don't need RescanFinished or RescanProgress notifications.
+	s.clientMtx.Lock()
 	s.finished = true
 	s.lastProgressSent = true
 	s.lastFilteredBlockHeader = nil
+	s.clientMtx.Unlock()
 
 	// Rescan with just the specified addresses.
 	newRescanner := s.getNewRescanner()
@@ -510,7 +519,7 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		s.onBlockDisconnected(rescanQuit, hash, height, time)
 	}
 
-	s.rescan = newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+	rescanner := newRescanner(neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 		OnBlockConnected:         obc,
 		OnFilteredBlockConnected: ofbc,
 		OnBlockDisconnected:      obd,
@@ -520,10 +529,12 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		neutrino.WatchAddrs(addrs...),
 	)
 
+	s.rescannerCh <- rescanner
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.consumeRescanErr(rescanQuit, s.rescan.Start())
+		s.consumeRescanErr(rescanQuit, rescanner.Start())
 	}()
 
 	return nil
