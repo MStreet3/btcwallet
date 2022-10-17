@@ -1,4 +1,4 @@
-module github.com/btcsuite/btcwallet
+module github.com/mstreet3/btcwallet
 
 require (
 	github.com/btcsuite/btcd v0.23.1
