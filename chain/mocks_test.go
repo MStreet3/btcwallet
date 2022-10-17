@@ -11,14 +11,15 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/neutrino"
+	"github.com/lightninglabs/neutrino/banman"
 	"github.com/lightninglabs/neutrino/headerfs"
 )
 
 var (
-	ErrNotImplemented              = errors.New("not implemented")
-	_                 Rescanner    = (*mockRescanner)(nil)
-	_                 ChainService = (*mockChainService)(nil)
-	testBestBlock                  = &headerfs.BlockStamp{
+	ErrNotImplemented                      = errors.New("not implemented")
+	_                 Rescanner            = (*mockRescanner)(nil)
+	_                 NeutrinoChainService = (*mockChainService)(nil)
+	testBestBlock                          = &headerfs.BlockStamp{
 		Height: 42,
 	}
 )
@@ -126,3 +127,20 @@ func (m *mockChainService) GetCFilter(
 ) (*gcs.Filter, error) {
 	return nil, ErrNotImplemented
 }
+
+func (m *mockChainService) GetUtxo(_ ...neutrino.RescanOption) (*neutrino.SpendReport, error) {
+	return nil, ErrNotImplemented
+}
+
+func (m *mockChainService) BanPeer(string, banman.Reason) error { return ErrNotImplemented }
+func (m *mockChainService) IsBanned(addr string) bool           { panic(ErrNotImplemented) }
+func (m *mockChainService) AddPeer(*neutrino.ServerPeer)        { panic(ErrNotImplemented) }
+func (m *mockChainService) AddBytesSent(uint64)                 { panic(ErrNotImplemented) }
+func (m *mockChainService) AddBytesReceived(uint64)             { panic(ErrNotImplemented) }
+func (m *mockChainService) NetTotals() (uint64, uint64)         { panic(ErrNotImplemented) }
+func (m *mockChainService) UpdatePeerHeights(*chainhash.Hash, int32, *neutrino.ServerPeer) {
+	panic(ErrNotImplemented)
+}
+func (m *mockChainService) ChainParams() chaincfg.Params           { panic(ErrNotImplemented) }
+func (m *mockChainService) Stop() error                            { panic(ErrNotImplemented) }
+func (m *mockChainService) PeerByAddr(string) *neutrino.ServerPeer { panic(ErrNotImplemented) }

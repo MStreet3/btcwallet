@@ -17,10 +17,11 @@ import (
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightninglabs/neutrino"
+	"github.com/lightninglabs/neutrino/banman"
 	"github.com/lightninglabs/neutrino/headerfs"
 )
 
-type ChainService interface {
+type NeutrinoChainService interface {
 	Start() error
 	GetBlock(chainhash.Hash, ...neutrino.QueryOption) (*btcutil.Block, error)
 	GetBlockHeight(*chainhash.Hash) (int32, error)
@@ -30,6 +31,17 @@ type ChainService interface {
 	IsCurrent() bool
 	SendTransaction(*wire.MsgTx) error
 	GetCFilter(chainhash.Hash, wire.FilterType, ...neutrino.QueryOption) (*gcs.Filter, error)
+	GetUtxo(...neutrino.RescanOption) (*neutrino.SpendReport, error)
+	BanPeer(string, banman.Reason) error
+	IsBanned(addr string) bool
+	AddPeer(*neutrino.ServerPeer)
+	AddBytesSent(uint64)
+	AddBytesReceived(uint64)
+	NetTotals() (uint64, uint64)
+	UpdatePeerHeights(*chainhash.Hash, int32, *neutrino.ServerPeer)
+	ChainParams() chaincfg.Params
+	Stop() error
+	PeerByAddr(string) *neutrino.ServerPeer
 }
 
 type Rescanner interface {
@@ -40,7 +52,7 @@ type Rescanner interface {
 
 // NeutrinoClient is an implementation of the btcwalet chain.Interface interface.
 type NeutrinoClient struct {
-	CS ChainService
+	CS NeutrinoChainService
 
 	chainParams *chaincfg.Params
 
