@@ -69,7 +69,7 @@ type NeutrinoClient struct {
 	currentBlock            chan *waddrmgr.BlockStamp
 
 	quit      chan struct{}
-	rescanErr <-chan error
+	rescanErr chan error
 	wg        sync.WaitGroup
 	started   bool
 	finished  bool
@@ -467,7 +467,17 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		neutrino.WatchInputs(inputsToWatch...),
 	)
 	s.rescannerCh <- newRescan
-	s.rescanErr = newRescan.Start()
+
+	// Only start the rescanner after it is sucessfully broadcast.
+	errCh := newRescan.Start()
+
+	// Start a goroutine to consume any errors and broadcast them on
+	// s.rescanErr.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.consumeRescanErr(rescanQuit, errCh)
+	}()
 
 	return nil
 }
@@ -539,7 +549,17 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		neutrino.WatchAddrs(addrs...),
 	)
 	s.rescannerCh <- newRescan
-	s.rescanErr = newRescan.Start()
+
+	// Only start the rescanner after it is sucessfully broadcast.
+	errCh := newRescan.Start()
+
+	// Start a goroutine to consume any errors and broadcast them on
+	// s.rescanErr.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.consumeRescanErr(rescanQuit, errCh)
+	}()
 
 	return nil
 }
@@ -811,6 +831,35 @@ out:
 	s.Stop()
 	close(s.dequeueNotification)
 	s.wg.Done()
+}
+
+// consumeRescanErr forwards errors from the rescan goroutine to the client.
+// Stops sending errors when either the client signals to quit, the rescanner
+// associated with the error channel is shutdown or the channel of errors is
+// closed.
+func (s *NeutrinoClient) consumeRescanErr(
+	rescanQuit <-chan struct{},
+	errCh <-chan error,
+) {
+	for {
+		select {
+		case <-s.quit:
+			return
+		case <-rescanQuit:
+			return
+		case err, open := <-errCh:
+			if !open {
+				return
+			}
+			select {
+			case s.rescanErr <- err:
+			case <-s.quit:
+				return
+			case <-rescanQuit:
+				return
+			}
+		}
+	}
 }
 
 // getNewRescanner injects the Rescanner constructor when called and defaults
