@@ -49,6 +49,7 @@ func newMockNeutrinoClient(t *testing.T,
 	return &NeutrinoClient{
 		CS:           &mockChainService{},
 		newRescanner: newRescanner,
+		rescanQuitCh: make(chan chan struct{}, 1),
 	}
 }
 

@@ -59,6 +59,7 @@ type NeutrinoClient struct {
 	// We currently support one rescan/notifiction goroutine per client
 	rescan       rescan.Interface
 	newRescanner rescan.NewFunc
+	rescanQuitCh chan (chan struct{})
 
 	enqueueNotification     chan interface{}
 	dequeueNotification     chan interface{}
@@ -67,14 +68,13 @@ type NeutrinoClient struct {
 	lastFilteredBlockHeader *wire.BlockHeader
 	currentBlock            chan *waddrmgr.BlockStamp
 
-	quit       chan struct{}
-	rescanQuit chan struct{}
-	rescanErr  <-chan error
-	wg         sync.WaitGroup
-	started    bool
-	scanning   bool
-	finished   bool
-	isRescan   bool
+	quit      chan struct{}
+	rescanErr <-chan error
+	wg        sync.WaitGroup
+	started   bool
+	scanning  bool
+	finished  bool
+	isRescan  bool
 
 	clientMtx sync.Mutex
 }
@@ -85,8 +85,9 @@ func NewNeutrinoClient(chainParams *chaincfg.Params,
 	chainService *neutrino.ChainService) *NeutrinoClient {
 
 	return &NeutrinoClient{
-		CS:          chainService,
-		chainParams: chainParams,
+		CS:           chainService,
+		chainParams:  chainParams,
+		rescanQuitCh: make(chan chan struct{}, 1),
 	}
 }
 
@@ -378,9 +379,11 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		return fmt.Errorf("can't do a rescan when the chain client " +
 			"is not started")
 	}
+	var rescanQuit chan struct{}
 	if s.scanning {
 		// Restart the rescan by killing the existing rescan.
-		close(s.rescanQuit)
+		rescanQuit = <-s.rescanQuitCh
+		close(rescanQuit)
 		rescan := s.rescan
 		s.clientMtx.Unlock()
 		rescan.WaitForShutdown()
@@ -388,7 +391,8 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		s.rescan = nil
 		s.rescanErr = nil
 	}
-	s.rescanQuit = make(chan struct{})
+	rescanQuit = make(chan struct{})
+	s.rescanQuitCh <- rescanQuit
 	s.scanning = true
 	s.finished = false
 	s.lastProgressSent = false
@@ -418,7 +422,6 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 	if header.BlockHash() == *startHash {
 		s.clientMtx.Lock()
 		s.finished = true
-		rescanQuit := s.rescanQuit
 		s.clientMtx.Unlock()
 
 		// Release the lock while dispatching the notification since
@@ -432,22 +435,34 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		}:
 		case <-s.quit:
 			return nil
-		case <-rescanQuit:
-			return nil
 		}
 	}
 
 	s.clientMtx.Lock()
 	newRescanner := s.getNewRescanner()
+
+	// Wrap the quit channel inside closures to use as handlers.
+	obc := func(hash *chainhash.Hash, height int32, time time.Time) {
+		s.onBlockConnected(rescanQuit, hash, height, time)
+	}
+
+	ofbc := func(height int32, header *wire.BlockHeader, txs []*btcutil.Tx) {
+		s.onFilteredBlockConnected(rescanQuit, height, header, txs)
+	}
+
+	obd := func(hash *chainhash.Hash, height int32, time time.Time) {
+		s.onBlockDisconnected(rescanQuit, hash, height, time)
+	}
+
 	newRescan := newRescanner(
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
-			OnBlockConnected:         s.onBlockConnected,
-			OnFilteredBlockConnected: s.onFilteredBlockConnected,
-			OnBlockDisconnected:      s.onBlockDisconnected,
+			OnBlockConnected:         obc,
+			OnFilteredBlockConnected: ofbc,
+			OnBlockDisconnected:      obd,
 		}),
 		neutrino.StartBlock(&headerfs.BlockStamp{Hash: *startHash}),
 		neutrino.StartTime(s.startTime),
-		neutrino.QuitChan(s.rescanQuit),
+		neutrino.QuitChan(rescanQuit),
 		neutrino.WatchAddrs(addrs...),
 		neutrino.WatchInputs(inputsToWatch...),
 	)
@@ -482,7 +497,8 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 		return s.rescan.Update(neutrino.AddAddrs(addrs...))
 	}
 
-	s.rescanQuit = make(chan struct{})
+	rescanQuit := make(chan struct{})
+	s.rescanQuitCh <- rescanQuit
 	s.scanning = true
 
 	// Don't need RescanFinished or RescanProgress notifications.
@@ -492,14 +508,28 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 
 	// Rescan with just the specified addresses.
 	newRescanner := s.getNewRescanner()
+
+	// Wrap the quit channel inside closures to use as handlers.
+	obc := func(hash *chainhash.Hash, height int32, time time.Time) {
+		s.onBlockConnected(rescanQuit, hash, height, time)
+	}
+
+	ofbc := func(height int32, header *wire.BlockHeader, txs []*btcutil.Tx) {
+		s.onFilteredBlockConnected(rescanQuit, height, header, txs)
+	}
+
+	obd := func(hash *chainhash.Hash, height int32, time time.Time) {
+		s.onBlockDisconnected(rescanQuit, hash, height, time)
+	}
+
 	newRescan := newRescanner(
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
-			OnBlockConnected:         s.onBlockConnected,
-			OnFilteredBlockConnected: s.onFilteredBlockConnected,
-			OnBlockDisconnected:      s.onBlockDisconnected,
+			OnBlockConnected:         obc,
+			OnFilteredBlockConnected: ofbc,
+			OnBlockDisconnected:      obd,
 		}),
 		neutrino.StartTime(s.startTime),
-		neutrino.QuitChan(s.rescanQuit),
+		neutrino.QuitChan(rescanQuit),
 		neutrino.WatchAddrs(addrs...),
 	)
 	s.rescan = newRescan
@@ -528,8 +558,8 @@ func (s *NeutrinoClient) SetStartTime(startTime time.Time) {
 
 // onFilteredBlockConnected sends appropriate notifications to the notification
 // channel.
-func (s *NeutrinoClient) onFilteredBlockConnected(height int32,
-	header *wire.BlockHeader, relevantTxs []*btcutil.Tx) {
+func (s *NeutrinoClient) onFilteredBlockConnected(rescanQuit <-chan struct{},
+	height int32, header *wire.BlockHeader, relevantTxs []*btcutil.Tx) {
 	ntfn := FilteredBlockConnected{
 		Block: &wtxmgr.BlockMeta{
 			Block: wtxmgr.Block{
@@ -555,7 +585,7 @@ func (s *NeutrinoClient) onFilteredBlockConnected(height int32,
 	case s.enqueueNotification <- ntfn:
 	case <-s.quit:
 		return
-	case <-s.rescanQuit:
+	case <-rescanQuit:
 		return
 	}
 
@@ -564,12 +594,13 @@ func (s *NeutrinoClient) onFilteredBlockConnected(height int32,
 	s.clientMtx.Unlock()
 
 	// Handle RescanFinished notification if required.
-	s.dispatchRescanFinished()
+	s.dispatchRescanFinished(rescanQuit)
 }
 
 // onBlockDisconnected sends appropriate notifications to the notification
 // channel.
-func (s *NeutrinoClient) onBlockDisconnected(hash *chainhash.Hash, height int32,
+func (s *NeutrinoClient) onBlockDisconnected(rescanQuit <-chan struct{},
+	hash *chainhash.Hash, height int32,
 	t time.Time) {
 	select {
 	case s.enqueueNotification <- BlockDisconnected{
@@ -580,12 +611,12 @@ func (s *NeutrinoClient) onBlockDisconnected(hash *chainhash.Hash, height int32,
 		Time: t,
 	}:
 	case <-s.quit:
-	case <-s.rescanQuit:
+	case <-rescanQuit:
 	}
 }
 
-func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
-	time time.Time) {
+func (s *NeutrinoClient) onBlockConnected(rescanQuit <-chan struct{},
+	hash *chainhash.Hash, height int32, time time.Time) {
 	// TODO: Move this closure out and parameterize it? Is it useful
 	// outside here?
 	sendRescanProgress := func() {
@@ -596,7 +627,7 @@ func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
 			Time:   time,
 		}:
 		case <-s.quit:
-		case <-s.rescanQuit:
+		case <-rescanQuit:
 		}
 	}
 	// Only send BlockConnected notification if we're processing blocks
@@ -636,20 +667,20 @@ func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
 			Time: time,
 		}:
 		case <-s.quit:
-		case <-s.rescanQuit:
+		case <-rescanQuit:
 		}
 	}
 
 	// Check if we're able to dispatch our final RescanFinished notification
 	// after processing this block.
-	s.dispatchRescanFinished()
+	s.dispatchRescanFinished(rescanQuit)
 }
 
 // dispatchRescanFinished determines whether we're able to dispatch our final
 // RescanFinished notification in order to mark the wallet as synced with the
 // chain. If the notification has already been dispatched, then it won't be done
 // again.
-func (s *NeutrinoClient) dispatchRescanFinished() {
+func (s *NeutrinoClient) dispatchRescanFinished(rescanQuit <-chan struct{}) {
 	bs, err := s.CS.BestBlock()
 	if err != nil {
 		log.Errorf("Can't get chain service's best block: %s", err)
@@ -687,7 +718,7 @@ func (s *NeutrinoClient) dispatchRescanFinished() {
 	}:
 	case <-s.quit:
 		return
-	case <-s.rescanQuit:
+	case <-rescanQuit:
 		return
 	}
 }
